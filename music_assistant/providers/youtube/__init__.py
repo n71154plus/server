@@ -731,6 +731,9 @@ class YouTubeProvider(MusicProvider):
     _recommendation_cache_at: float = 0.0      # 快取建立時間
     _ytmusic_language: str = ""                # ytmusicapi 語系（空則 en）
     _ytmusic_enrich_artist: str = "always"     # get_song 補藝人名策略
+    _cookies_cache: tuple[float, dict[str, str]] | None = None  # cookies.txt 解析快取（mtime, cookies）
+    _token_lock: Any = None                    # 防止並發 token refresh
+    _ytm_author_cache: dict[str, tuple[float, str]] = {}  # get_song author 快取（TTL 24h）
 
     # MA provider key → yt-dlp client key
     _YTDLP_CLIENT_MAP: dict[str, str] = {
@@ -873,7 +876,13 @@ print(json.dumps(d))
         self._innertube_fail_until = 0.0
         self._prefetch_in_progress = set()
         self._prefetch_task = None
-        self._sync_innertube_clients_from_ytdlp(logger=self.logger)
+        self._cookies_cache = None
+        self._ytm_author_cache = {}
+        self._token_lock = asyncio.Lock()
+        # yt-dlp 版本同步走 subprocess（最長 30s），放到 executor 避免阻塞事件迴圈
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._sync_innertube_clients_from_ytdlp, self.logger
+        )
         self._client_id     = self.config.get_value(CONF_CLIENT_ID) or ""
         self._client_secret = self.config.get_value(CONF_CLIENT_SECRET) or ""
         self._auth_mode = self.config.get_value(CONF_AUTH_MODE) or "tv"
@@ -995,6 +1004,19 @@ print(json.dumps(d))
                 1, self.mass.load_provider_config, config, task_id=task_id
             )
 
+    async def unload(self, is_removed: bool = False) -> None:
+        """
+        Handle unload/close of the provider.
+
+        :param is_removed: True if the provider is being removed (not just reloaded).
+        """
+        if self._prefetch_task and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
+        self._prefetch_task = None
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+        self._http_session = None
+
     # ------------------------------------------------------------------
     # 功能宣告
     # ------------------------------------------------------------------
@@ -1115,7 +1137,6 @@ print(json.dumps(d))
         use_web_client=True 時用 WEB client（FEplaylists 等個人頁面需要）；
         否則用 TVHTML5 client（串流、搜尋等）。
         """
-        import aiohttp
         import copy
 
         url = f"{INNERTUBE_BASE}/{endpoint}?prettyPrint=false"
@@ -1176,7 +1197,12 @@ print(json.dumps(d))
         """取得共用 aiohttp ClientSession（懶建立，自動偵測關閉後重建）。"""
         import aiohttp
         if self._http_session is None or self._http_session.closed:
-            self._http_session = aiohttp.ClientSession()
+            self._http_session = aiohttp.ClientSession(
+                # 設定 timeout 避免 InnerTube 偶發不回應時請求無限期卡住
+                timeout=aiohttp.ClientTimeout(total=30, connect=10),
+                # DNS 快取 + 連線重用，降低每個 API 請求的建立開銷
+                connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300),
+            )
         return self._http_session
 
     def _handle_quota_exceeded(self) -> None:
@@ -1311,7 +1337,7 @@ print(json.dumps(d))
     # ------------------------------------------------------------------
 
     async def _ensure_fresh_token(self) -> None:
-        """Token 快過期時自動刷新（提前 5 分鐘）。"""
+        """Token 快過期時自動刷新（提前 5 分鐘），以 lock 防止並發重複刷新。"""
         if not self._access_token:
             return
         if time.time() < self._token_expires_at - 300:
@@ -1319,7 +1345,13 @@ print(json.dumps(d))
         if not self._refresh_token:
             self.logger.warning("[YouTube] Token 快過期且無 refresh token，請重新登入")
             return
-        await self._refresh_access_token()
+        if self._token_lock is None:
+            self._token_lock = asyncio.Lock()
+        async with self._token_lock:
+            # 取得 lock 後再檢查一次：等待期間可能已被其他呼叫者刷新
+            if time.time() < self._token_expires_at - 300:
+                return
+            await self._refresh_access_token()
 
     async def _refresh_access_token(self) -> None:
         """以 refresh_token 換取新的 access_token 並持久化。"""
@@ -1430,6 +1462,13 @@ print(json.dumps(d))
         """解析 cookies.txt（Netscape 格式），回傳 youtube.com 的 cookie dict。"""
         if not self._cookies_file:
             return {}
+        # 以檔案 mtime 做快取，避免每次 InnerTube WEB 請求都在事件迴圈上重新讀檔
+        try:
+            mtime = os.path.getmtime(self._cookies_file)
+        except OSError:
+            return {}
+        if self._cookies_cache is not None and self._cookies_cache[0] == mtime:
+            return self._cookies_cache[1]
         cookies: dict[str, str] = {}
         try:
             with open(self._cookies_file, "r", encoding="utf-8") as f:
@@ -1445,6 +1484,7 @@ print(json.dumps(d))
                         cookies[name] = value
         except Exception as exc:
             self.logger.debug(f"[YouTube] 解析 cookies.txt 失敗: {exc}")
+        self._cookies_cache = (mtime, cookies)
         return cookies
 
     def _innertube_cookie_headers(self) -> dict[str, str]:
@@ -1956,71 +1996,67 @@ print(json.dumps(d))
         self, search_query: str, media_types: list[Any], limit: int = 10
     ) -> SearchResults:
         await self._ensure_fresh_token()
+        has_ytm = self._ytmusic is not None
 
-        tracks: list[Track] = []
-        playlists: list[Playlist] = []
-        artists: list[Artist] = []
-        albums: list[Album] = []
+        async def _empty() -> list:
+            return []
 
-        # 搜尋 tracks：YTMusic（優先）+ YouTube 合併
+        async def _merged(kind: str, yt_coro, ytm_coro, merge) -> list:
+            # YouTube 與 YTMusic 並行查詢後合併（YTMusic 優先），單邊失敗不影響另一邊
+            yt_res, ytm_res = await asyncio.gather(
+                yt_coro, ytm_coro, return_exceptions=True
+            )
+            if isinstance(ytm_res, BaseException):
+                self.logger.warning(
+                    f"[YouTube] ytmusic 搜尋 {kind} 失敗，僅用 YouTube 結果: {ytm_res}"
+                )
+                ytm_res = []
+            if isinstance(yt_res, BaseException):
+                self.logger.warning(f"[YouTube] 搜尋 {kind} (YouTube) 失敗: {yt_res}")
+                yt_res = []
+            return merge(ytm_res, yt_res, limit)
+
+        # 各 media type 的搜尋全部並行執行，大幅縮短整體搜尋延遲
+        pending: dict[str, Any] = {}
         if not media_types or MediaType.TRACK in media_types:
-            yt_tracks = await self._search_tracks(search_query, limit)
-            if self._ytmusic:
-                try:
-                    ytm_tracks = await self._search_tracks_via_ytmusic(
-                        search_query, limit
-                    )
-                    tracks = self._merge_search_tracks(
-                        ytm_tracks, yt_tracks, limit
-                    )
-                except Exception as exc:
-                    self.logger.warning(
-                        f"[YouTube] ytmusic 搜尋 tracks 失敗，僅用 YouTube 結果: {exc}"
-                    )
-                    tracks = yt_tracks
-            else:
-                tracks = yt_tracks
-
-        # 搜尋 playlists
+            pending["tracks"] = _merged(
+                "tracks",
+                self._search_tracks(search_query, limit),
+                self._search_tracks_via_ytmusic(search_query, limit)
+                if has_ytm else _empty(),
+                self._merge_search_tracks,
+            )
         if not media_types or MediaType.PLAYLIST in media_types:
-            yt_pl = await self._search_playlists(search_query, limit)
-            if self._ytmusic:
-                try:
-                    ytm_pl = await self._search_playlists_via_ytmusic(
-                        search_query, limit
-                    )
-                    playlists = self._merge_search_playlists(ytm_pl, yt_pl, limit)
-                except Exception as exc:
-                    self.logger.warning(
-                        f"[YouTube] ytmusic 搜尋 playlists 失敗，僅用 YouTube 結果: {exc}"
-                    )
-                    playlists = yt_pl
-            else:
-                playlists = yt_pl
-
-        # 搜尋 artists（頻道 + YTMusic 藝人）
+            pending["playlists"] = _merged(
+                "playlists",
+                self._search_playlists(search_query, limit),
+                self._search_playlists_via_ytmusic(search_query, limit)
+                if has_ytm else _empty(),
+                self._merge_search_playlists,
+            )
         if not media_types or MediaType.ARTIST in media_types:
-            yt_art = await self._search_artists(search_query, limit)
-            if self._ytmusic:
-                try:
-                    ytm_art = await self._search_artists_via_ytmusic(
-                        search_query, limit
-                    )
-                    artists = self._merge_search_artists(ytm_art, yt_art, limit)
-                except Exception as exc:
-                    self.logger.warning(
-                        f"[YouTube] ytmusic 搜尋 artists 失敗，僅用 YouTube 結果: {exc}"
-                    )
-                    artists = yt_art
-            else:
-                artists = yt_art
-
+            pending["artists"] = _merged(
+                "artists",
+                self._search_artists(search_query, limit),
+                self._search_artists_via_ytmusic(search_query, limit)
+                if has_ytm else _empty(),
+                self._merge_search_artists,
+            )
         # 專輯：僅 YTMusic 有結構化結果
-        if (not media_types or MediaType.ALBUM in media_types) and self._ytmusic:
-            try:
-                albums = await self._search_albums_via_ytmusic(search_query, limit)
-            except Exception as exc:
-                self.logger.warning(f"[YouTube] ytmusic 搜尋 albums 失敗: {exc}")
+        if (not media_types or MediaType.ALBUM in media_types) and has_ytm:
+            pending["albums"] = _merged(
+                "albums",
+                _empty(),
+                self._search_albums_via_ytmusic(search_query, limit),
+                lambda ytm, _yt, lim: ytm[:lim],
+            )
+
+        gathered = await asyncio.gather(*pending.values()) if pending else []
+        results = dict(zip(pending.keys(), gathered))
+        tracks: list[Track] = results.get("tracks", [])
+        playlists: list[Playlist] = results.get("playlists", [])
+        artists: list[Artist] = results.get("artists", [])
+        albums: list[Album] = results.get("albums", [])
 
         self.logger.debug(
             f"[YouTube] 搜尋「{search_query}」→ "
@@ -3045,16 +3081,29 @@ print(json.dumps(d))
             if not re.search(r"[\u4e00-\u9fff]", title):
                 return
         vid = track.item_id
-        loop = asyncio.get_event_loop()
-        try:
-            data = await loop.run_in_executor(
-                None, lambda v=vid: self._ytmusic.get_song(v),
-            )
-        except Exception as exc:
-            self.logger.debug(f"[YouTube] ytmusic get_song 補藝人名失敗: {exc}")
-            return
-        vd = data.get("videoDetails") or {}
-        author = (vd.get("author") or "").strip()
+        # author 快取：同步/重整時 MA 會對大量 track 重複呼叫 get_track，
+        # 避免每首歌都多打一次 YTM get_song
+        cached = self._ytm_author_cache.get(vid)
+        if cached and time.time() < cached[0]:
+            author = cached[1]
+        else:
+            loop = asyncio.get_event_loop()
+            try:
+                data = await loop.run_in_executor(
+                    None, lambda v=vid: self._ytmusic.get_song(v),
+                )
+            except Exception as exc:
+                self.logger.debug(f"[YouTube] ytmusic get_song 補藝人名失敗: {exc}")
+                return
+            vd = data.get("videoDetails") or {}
+            author = (vd.get("author") or "").strip()
+            if len(self._ytm_author_cache) > 2000:
+                now_ts = time.time()
+                for key in [
+                    k for k, v in self._ytm_author_cache.items() if v[0] <= now_ts
+                ]:
+                    del self._ytm_author_cache[key]
+            self._ytm_author_cache[vid] = (time.time() + 24 * 3600, author)
         if not author:
             return
         a0 = track.artists[0]
@@ -4224,8 +4273,6 @@ print(json.dumps(d))
 
         先完整收集所有清單，再一次性 yield，確保中途失敗時不 yield 部分資料。
         """
-        import aiohttp
-
         headers = {"Authorization": f"Bearer {self._access_token}"}
         params = {
             "part": "snippet,contentDetails",
@@ -4686,8 +4733,6 @@ print(json.dumps(d))
 
     async def _get_playlist_tracks_via_api(self, playlist_id: str) -> list[Track]:
         """透過 YouTube Data API v3 取得播放清單的 tracks（用於 PLAOYGtd_ 等私人清單）。"""
-        import aiohttp
-
         headers = {"Authorization": f"Bearer {self._access_token}"}
         params = {
             "part": "snippet",
@@ -4798,17 +4843,15 @@ print(json.dumps(d))
 
     async def _fetch_video_durations(self, video_ids: list[str]) -> dict[str, int]:
         """批次透過 Data API v3 取得影片時長，回傳 {video_id: duration_seconds}。"""
-        import aiohttp
         if not video_ids or not self._access_token:
             return {}
 
-        durations: dict[str, int] = {}
         import re
-        # 每次最多 50 個
-        for i in range(0, len(video_ids), 50):
-            batch = video_ids[i:i+50]
-            headers = {"Authorization": f"Bearer {self._access_token}"}
-            params  = {"part": "contentDetails", "id": ",".join(batch)}
+        durations: dict[str, int] = {}
+        headers = {"Authorization": f"Bearer {self._access_token}"}
+
+        async def _fetch_batch(batch: list[str]) -> None:
+            params = {"part": "contentDetails", "id": ",".join(batch)}
             try:
                 async with self._session.get(
                     f"{YOUTUBE_API_BASE}/videos", headers=headers, params=params,
@@ -4827,6 +4870,11 @@ print(json.dumps(d))
                             )
             except Exception as exc:
                 self.logger.debug(f"[YouTube] 批次取得 duration 失敗: {exc}")
+
+        # 每批最多 50 個，各批次並行送出
+        await asyncio.gather(
+            *(_fetch_batch(video_ids[i:i + 50]) for i in range(0, len(video_ids), 50))
+        )
         return durations
 
     def _json_to_playlist(self, data: dict) -> Playlist | None:
@@ -5280,6 +5328,13 @@ print(json.dumps(d))
             }
 
         def _cache_and_return(res: dict) -> dict:
+            # 快取過大時先清掉過期項目，避免長時間運行後記憶體無限增長
+            if len(self._direct_url_cache) > 500:
+                now_ts = time.time()
+                for key in [
+                    k for k, v in self._direct_url_cache.items() if v[0] <= now_ts
+                ]:
+                    del self._direct_url_cache[key]
             self._direct_url_cache[item_id] = (
                 time.time() + self._DIRECT_URL_CACHE_TTL, res
             )
@@ -5496,10 +5551,22 @@ print(json.dumps(d))
             except Exception as e:
                 raise UnplayableMediaError(f"YouTube 影片無法播放: {item_id} - {e}") from e
 
+        # yt-dlp 路徑錯開啟動：run_in_executor 一旦開跑便無法中途取消，
+        # InnerTube 通常 <1s 成功，稍加延遲可避免每次播放都白跑一次完整 yt-dlp 解析
+        # （省下 executor 執行緒與對 YouTube 的多餘請求）。
+        # 快取已命中（背景預取）時不延遲，維持 ~0ms 直接回傳。
+        cached_url = self._direct_url_cache.get(item_id)
+        has_url_cache = bool(cached_url and now < cached_url[0])
+
+        async def _ytdlp_path_staggered() -> tuple[StreamDetails, int]:
+            if not has_url_cache:
+                await asyncio.sleep(1.5)
+            return await _ytdlp_path()
+
         # 並行競速：誰先成功就用誰
         tasks: dict[asyncio.Task, str] = {
             asyncio.ensure_future(_innertube_path()): "innertube",
-            asyncio.ensure_future(_ytdlp_path()): "ytdlp",
+            asyncio.ensure_future(_ytdlp_path_staggered()): "ytdlp",
         }
         errors: dict[str, BaseException] = {}
         pending = set(tasks.keys())
