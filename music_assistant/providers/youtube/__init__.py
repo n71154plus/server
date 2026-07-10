@@ -135,6 +135,24 @@ CONF_YTMUSIC_ENRICH_ARTIST = "ytmusic_enrich_artist"  # get_song 補藝人名：
 # 模組層級函數（MA 框架呼叫）
 # ---------------------------------------------------------------------------
 
+def _decrypt_if_needed(mass: MusicAssistant, value: str) -> str:
+    """
+    相容處理舊版加密值。
+
+    client_secret 由 SECURE_STRING 改為 STRING（避免瀏覽器密碼自動填入
+    造成儲存錯誤）後，既有設定中儲存的仍是加密字串，讀取時需手動解密。
+
+    :param mass: MusicAssistant 主實例（提供 decrypt_string）。
+    :param value: 設定中讀出的原始字串值。
+    """
+    if isinstance(value, str) and value.startswith("_encrypted_"):
+        try:
+            return mass.config.decrypt_string(value)
+        except Exception:
+            return value
+    return value
+
+
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> MusicProvider:
@@ -212,11 +230,16 @@ async def get_config_entries(
                                 raise Exception(f"HTTP {resp.status}: {resp_text[:300]}")
                         device_data = json.loads(resp_text)
 
-                # 把 device_code 暫存在 values，讓 MA 傳給下一次呼叫
+                # 把 device_code 與授權資訊一併暫存在 values（hidden 持久化欄位），
+                # 讓後續的 check_auth / 頁面重新整理都能還原授權網址與代碼
                 values[CONF_PENDING_DEVICE_CODE] = json.dumps({
                     "device_code": device_data["device_code"],
                     "interval":    device_data.get("interval", 5),
                     "expires_at":  time.time() + device_data.get("expires_in", 1800),
+                    "verification_url": device_data.get(
+                        "verification_url", "https://www.google.com/device"
+                    ),
+                    "user_code": device_data["user_code"],
                 })
                 values["_auth_step"] = "pending"
                 values["_verification_url"] = device_data["verification_url"]
@@ -240,6 +263,15 @@ async def get_config_entries(
                 device_code = pending["device_code"]
                 interval    = pending.get("interval", 5)
                 expires_at  = pending.get("expires_at", 0)
+                # 還原授權網址/代碼（頁面重新整理後 _verification_url 可能遺失）
+                if pending.get("verification_url"):
+                    values.setdefault("_verification_url", pending["verification_url"])
+                if pending.get("user_code"):
+                    values.setdefault("_user_code", pending["user_code"])
+                if expires_at and time.time() > expires_at:
+                    raise Exception(
+                        "授權代碼已過期（有效期約 30 分鐘），請重新按「開始登入」取得新代碼。"
+                    )
 
                 auth_mode = values.get(CONF_AUTH_MODE, "tv")
                 if auth_mode == "tv":
@@ -247,7 +279,9 @@ async def get_config_entries(
                     csecret = YOUTUBE_TV_CLIENT_SECRET
                 else:
                     cid = values.get(CONF_CLIENT_ID, "").strip()
-                    csecret = values.get(CONF_CLIENT_SECRET, "").strip()
+                    csecret = _decrypt_if_needed(
+                        mass, values.get(CONF_CLIENT_SECRET, "") or ""
+                    ).strip()
 
                 poll_payload = {
                     "client_id":     cid,
@@ -320,89 +354,105 @@ async def get_config_entries(
     auth_step   = values.get("_auth_step", "")
     has_token   = bool(values.get(CONF_AUTH_TOKEN))
 
+    # 若授權流程進行中，從 hidden 暫存欄位還原授權網址/代碼
+    # （頁面重新整理後 _verification_url / _user_code 會遺失）
+    verification_url = values.get("_verification_url") or ""
+    user_code = values.get("_user_code") or ""
+    if not has_token and (not verification_url or not user_code):
+        pending_raw = values.get(CONF_PENDING_DEVICE_CODE, "")
+        if pending_raw:
+            try:
+                _pending = json.loads(pending_raw)
+                # 代碼已過期就不還原，讓 UI 回到「開始登入」引導
+                if time.time() < _pending.get("expires_at", 0):
+                    verification_url = (
+                        verification_url or _pending.get("verification_url", "")
+                    )
+                    user_code = user_code or _pending.get("user_code", "")
+                    if user_code and auth_step not in ("error",):
+                        auth_step = auth_step or "pending"
+            except (json.JSONDecodeError, TypeError):
+                pass
+    verification_url = verification_url or "https://www.google.com/device"
+
     # --- 目前狀態提示 ---
     if has_token:
         # 已登入
         entries.append(ConfigEntry(
             key="auth_status",
             type=ConfigEntryType.ALERT,
-            label="✅ 已成功登入 YouTube 帳號，串流將使用已認證的身份。",
+            label=(
+                "✅ **已成功登入 YouTube 帳號**，串流將使用已認證的身份。\n\n"
+                "現在可以使用：個人播放清單、年齡限制／私人影片，"
+                "並大幅降低被 YouTube 限速的機率。\n"
+                "若要更換帳號，請先按下方「登出」，再重新走一次登入流程。"
+            ),
             required=False,
         ))
-    elif auth_step == "pending":
+    elif auth_step in ("pending", "still_pending"):
         # 等待使用者完成授權
-        verification_url = values.get("_verification_url", "https://www.google.com/device")
-        code = values.get("_user_code", "")
-
-        # 步驟說明（純文字 ALERT）
+        if auth_step == "still_pending":
+            entries.append(ConfigEntry(
+                key="auth_still_pending",
+                type=ConfigEntryType.ALERT,
+                label=(
+                    "⏳ **尚未偵測到授權完成。**\n\n"
+                    "請確認已在授權頁面輸入代碼並按下「允許」。"
+                    "Google 端偶爾需要幾秒鐘才會生效，稍等一下再按一次"
+                    "「我已完成授權」即可。\n"
+                    "若代碼已超過 30 分鐘，請按「重新取得授權代碼」拿新的代碼。"
+                ),
+                required=False,
+            ))
         entries.append(ConfigEntry(
             key="auth_instructions",
             type=ConfigEntryType.ALERT,
-            label="請依照以下步驟完成 YouTube 授權：",
+            label=(
+                "📋 **請依照以下 3 個步驟完成 YouTube 授權**（代碼有效約 30 分鐘）：\n\n"
+                f"**① 點擊開啟授權頁面 → [{verification_url}]({verification_url})**\n"
+                "手機或電腦的瀏覽器皆可，開啟後請登入你要使用的 Google 帳號。\n\n"
+                f"**② 在頁面中輸入代碼：`{user_code}`**\n"
+                "輸入後 Google 會詢問是否允許「在電視上使用 YouTube」存取帳號，"
+                "請按「允許」。\n\n"
+                "**③ 回到此頁面，按下方「我已完成授權」按鈕完成登入。**"
+            ),
             required=False,
         ))
-
-        # 步驟一：URL 用 STRING 唯讀欄位 → 點選即可框選複製，description 說明用途
+        # URL 與代碼另附唯讀輸入框，方便框選複製到其他裝置；
+        # 欄位旁的說明連結（? 圖示）也可直接點擊開啟授權頁
         entries.append(ConfigEntry(
             key="auth_verification_url",
             type=ConfigEntryType.STRING,
-            label="① 複製以下網址，在瀏覽器中開啟",
-            description="請複製此網址並在任意瀏覽器（手機或電腦均可）開啟，然後登入您的 Google 帳號完成授權。",
+            label="① 授權頁面網址（可複製；點欄位旁的連結圖示可直接開啟）",
             default_value=verification_url,
             value=verification_url,
             required=False,
+            help_link=verification_url,
         ))
-
-        # 步驟二：代碼用唯讀 STRING → 輸入框天生支援框選複製
         entries.append(ConfigEntry(
             key="auth_user_code",
             type=ConfigEntryType.STRING,
-            label="② 在授權頁面輸入以下代碼",
-            description="在 Google 授權頁面輸入此代碼以完成驗證。",
-            default_value=code,
-            value=code,
+            label="② 授權代碼（在授權頁面輸入）",
+            default_value=user_code,
+            value=user_code,
             required=False,
+            help_link=verification_url,
         ))
-
-        # 步驟三說明
-        entries.append(ConfigEntry(
-            key="auth_step3",
-            type=ConfigEntryType.LABEL,
-            label="③ 完成後按下方「確認已完成授權」按鈕",
-            required=False,
-        ))
-    elif auth_step == "still_pending":
-        verification_url = values.get("_verification_url", "https://www.google.com/device")
-        code = values.get("_user_code", "")
-        entries.append(ConfigEntry(
-            key="auth_status",
-            type=ConfigEntryType.ALERT,
-            label="⏳ 尚未偵測到授權完成，請確認已在瀏覽器完成登入後再試一次。",
-            required=False,
-        ))
-        if code:
-            entries.append(ConfigEntry(
-                key="auth_verification_url",
-                type=ConfigEntryType.STRING,
-                label="授權頁面網址（可框選複製）",
-                default_value=verification_url,
-                value=verification_url,
-                required=False,
-            ))
-            entries.append(ConfigEntry(
-                key="auth_user_code",
-                type=ConfigEntryType.STRING,
-                label="授權代碼（可框選複製）",
-                default_value=code,
-                value=code,
-                required=False,
-            ))
     elif auth_step == "error":
         error_msg = values.get("_auth_error", "未知錯誤")
         entries.append(ConfigEntry(
             key="auth_status",
             type=ConfigEntryType.ALERT,
-            label=f"❌ 登入失敗：{error_msg}\n\n請重新按「開始登入」。",
+            label=(
+                f"❌ **登入失敗**：{error_msg}\n\n"
+                "常見原因與解法：\n"
+                "- `invalid_client`／403：內建 TV 公開憑證被 Google 封鎖"
+                "（伺服器 IP 常見）→ 請切換到「自建 Google Cloud」模式\n"
+                "- 代碼過期（約 30 分鐘失效）→ 重新按「開始登入」取得新代碼\n"
+                "- `access_denied`：在 Google 頁面按了「拒絕」→ 重試並按「允許」\n"
+                "- `org_internal`：該 OAuth client 僅限組織內部 → 同意畫面請選「外部」\n\n"
+                "排除問題後，請再按一次下方「開始登入」。"
+            ),
             required=False,
         ))
     else:
@@ -411,22 +461,36 @@ async def get_config_entries(
             key="auth_status",
             type=ConfigEntryType.ALERT,
             label=(
-                "尚未登入 YouTube 帳號。\n"
-                "登入後 yt-dlp 將使用已認證身份，可大幅提升串流穩定性、"
-                "避免 YouTube 限速，並允許存取需登入的內容。"
+                "👋 **尚未登入 YouTube 帳號**（登入為選用，但強烈建議）。\n\n"
+                "登入後可獲得：\n"
+                "- 個人播放清單、年齡限制／私人影片的存取\n"
+                "- 更穩定的串流、大幅降低被 YouTube 限速的機率\n\n"
+                "登入流程（約 1 分鐘，全程不需在 MA 輸入帳號密碼）：\n"
+                "按下方「開始登入」→ 點擊顯示的授權連結 → 輸入代碼並按「允許」→ "
+                "回來按「我已完成授權」。"
             ),
             required=False,
         ))
 
-    # --- 步驟 1 按鈕：開始登入 ---
+    # --- 步驟 1 按鈕：開始登入 / 重新取得代碼 ---
     if not has_token:
+        _is_retry = auth_step in ("pending", "still_pending", "error")
         entries.append(ConfigEntry(
             key=CONF_ACTION_START_AUTH,
             type=ConfigEntryType.ACTION,
-            label="🔐 開始登入（取得授權代碼）",
-            description="點擊後頁面將顯示授權 URL 和代碼，請在瀏覽器中完成操作。",
+            label=(
+                "🔐 重新取得授權代碼" if _is_retry
+                else "🔐 開始登入（取得授權代碼）"
+            ),
+            description=(
+                "點擊後會向 Google 申請一組新的授權連結與代碼，"
+                "並顯示在上方（舊代碼會同時失效）。"
+                if _is_retry else
+                "點擊後頁面會顯示授權連結和代碼，"
+                "用任何裝置的瀏覽器點開連結、輸入代碼即可。"
+            ),
             action=CONF_ACTION_START_AUTH,
-            action_label="開始登入",
+            action_label="重新取得代碼" if _is_retry else "開始登入",
             required=False,
         ))
 
@@ -436,7 +500,10 @@ async def get_config_entries(
             key=CONF_ACTION_CHECK_AUTH,
             type=ConfigEntryType.ACTION,
             label="✅ 我已完成授權（點擊確認並取得 Token）",
-            description="在瀏覽器完成 Google 帳號授權後，點此按鈕完成登入。",
+            description=(
+                "在瀏覽器完成 Google 帳號授權（輸入代碼並按「允許」）後，"
+                "點此按鈕完成登入。系統會向 Google 確認授權狀態（最多等 30 秒）。"
+            ),
             action=CONF_ACTION_CHECK_AUTH,
             action_label="確認已完成授權",
             required=False,
@@ -448,6 +515,7 @@ async def get_config_entries(
             key="logout",
             type=ConfigEntryType.ACTION,
             label="🚪 登出 YouTube 帳號",
+            description="清除已儲存的授權 Token。登出後仍可以匿名模式搜尋與播放公開影片。",
             action="logout",
             action_label="登出",
             required=False,
@@ -458,37 +526,7 @@ async def get_config_entries(
     entries.append(ConfigEntry(
         key="api_mode_title",
         type=ConfigEntryType.LABEL,
-        label="⚙️ API 模式",
-        required=False,
-    ))
-    entries.append(ConfigEntry(
-        key="api_mode_info",
-        type=ConfigEntryType.ALERT,
-        label=(
-            "【模式比較】\n\n"
-            "🔴 僅 yt-dlp\n"
-            "  速度慢（1-3s）| 零配額 | 設定最簡單\n"
-            "  Fallback：yt-dlp only\n\n"
-            "🟡 自建 Google Cloud（Data API v3）\n"
-            "  速度快（100-400ms）| 10,000 units/天 | 需建 Cloud 專案\n"
-            "  Fallback：Data API v3 → InnerTube → yt-dlp\n\n"
-            "🟢 YouTube TV（InnerTube）建議\n"
-            "  速度快（200-400ms）| 零配額 | 無需 Cloud 專案\n"
-            "  Fallback：InnerTube → yt-dlp\n\n"
-            "【功能支援】✅可用  ⚠️需條件  ❌不可用\n\n"
-            "功能               yt-dlp  custom   tv\n"
-            "搜尋影片/清單/頻道   ✅      ✅       ✅\n"
-            "播放影片串流         ✅      ✅       ✅\n"
-            "瀏覽頻道影片         ✅      ✅       ✅\n"
-            "公開播放清單         ✅      ✅       ✅\n"
-            "個人播放清單列表   ⚠️cookies ⚠️OAuth  ⚠️OAuth\n"
-            "個人清單(PLAOYGtd_)  ❌    ⚠️OAuth  ⚠️OAuth\n"
-            "年齡限制影片       ⚠️cookies ✅OAuth  ✅OAuth\n"
-            "私人影片           ⚠️cookies ✅OAuth  ✅OAuth\n\n"
-            "⚠️ cookies = 需設定 Cookies 檔案路徑\n"
-            "✅ OAuth   = 已完成 OAuth 登入即可，不需 cookies\n"
-            "⚠️ OAuth   = 需完成 OAuth 登入"
-        ),
+        label="⚙️ API 模式（不確定就用預設的 YouTube TV 即可）",
         required=False,
     ))
 
@@ -498,13 +536,40 @@ async def get_config_entries(
         key=CONF_AUTH_MODE,
         type=ConfigEntryType.STRING,
         label="API 模式選擇",
+        description=(
+            "決定搜尋／瀏覽走哪個 YouTube API。三種模式都能搜尋、播放與瀏覽公開內容；"
+            "差別在速度、配額與需要的前置設定。點各選項可看個別說明。"
+        ),
         default_value="tv",
         required=False,
         value=auth_mode,
         options=[
-            ConfigValueOption(title="🟢 YouTube TV（InnerTube，建議）", value="tv"),
-            ConfigValueOption(title="🟡 自建 Google Cloud（Data API v3）", value="custom"),
-            ConfigValueOption(title="🔴 僅 yt-dlp（無需 API）", value="ytdlp"),
+            ConfigValueOption(
+                title="🟢 YouTube TV（InnerTube，建議）",
+                value="tv",
+                description=(
+                    "速度快（約 200-400ms）、零配額、不需要 Google Cloud 專案，"
+                    "登入用內建 TV 公開憑證（與 SmartTube／NewPipe 相同）。"
+                    "失敗時自動退回 yt-dlp。"
+                ),
+            ),
+            ConfigValueOption(
+                title="🟡 自建 Google Cloud（Data API v3）",
+                value="custom",
+                description=(
+                    "速度最快（約 100-400ms）但每天有 10,000 units 配額，"
+                    "需自行建立 Google Cloud 專案與 OAuth 憑證（下方有完整教學）。"
+                    "配額用完自動切換 InnerTube → yt-dlp，不需重啟。"
+                ),
+            ),
+            ConfigValueOption(
+                title="🔴 僅 yt-dlp（無需 API）",
+                value="ytdlp",
+                description=(
+                    "設定最簡單、完全不依賴 Google API，但搜尋／瀏覽較慢（約 1-3 秒）。"
+                    "個人播放清單、年齡限制影片需要提供 Cookies 檔案。"
+                ),
+            ),
         ],
         multi_value=False,
     ))
@@ -515,13 +580,12 @@ async def get_config_entries(
             key="tv_mode_note",
             type=ConfigEntryType.ALERT,
             label=(
-                "✅ 已選擇 YouTube TV 模式。\n"
-                "使用內建公開憑證（與 Smarttube、NewPipe 相同），無需自建 Google Cloud 專案。\n"
-                "點擊「開始登入」即可授權，授權頁面會顯示為「在電視上使用 YouTube」。\n\n"
-                "⚠️ 注意：若出現 403 invalid_client 錯誤，表示 Google 已封鎖此公開憑證（伺服器 IP 尤其常見）。\n"
-                "解決方式：切換到「自建 Google Cloud」模式，使用自己建立的 OAuth 憑證。\n"
-                "建立步驟：Google Cloud Console → APIs & Services → Credentials → "
-                "Create OAuth client ID（類型選「TV and Limited Input devices」）→ 啟用 YouTube Data API v3"
+                "✅ **已選擇 YouTube TV 模式**（建議）。\n\n"
+                "使用內建公開憑證（與 SmartTube、NewPipe 相同），無需自建 Google Cloud 專案。"
+                "直接到上方按「開始登入」即可，授權頁面會顯示為「在電視上使用 YouTube」。\n\n"
+                "⚠️ 若登入時出現 `403 invalid_client`，代表 Google 暫時封鎖了這組公開憑證"
+                "（伺服器 IP 尤其常見）。解法：切換到「自建 Google Cloud」模式，"
+                "依照顯示的教學建立自己的憑證。"
             ),
             required=False,
         ))
@@ -537,40 +601,68 @@ async def get_config_entries(
             key="custom_mode_note",
             type=ConfigEntryType.ALERT,
             label=(
-                "需要在 Google Cloud Console 建立專案並啟用 YouTube Data API v3。\n"
-                "建立方式：APIs & Services → Credentials → Create OAuth client ID\n"
-                "（應用程式類型選「TV and Limited Input devices」）\n"
-                "Fallback 順序：Data API v3 → InnerTube → yt-dlp\n"
-                "配額用完（403）後自動切換 InnerTube，不需要重啟。"
+                "📖 **建立自己的 OAuth 憑證（一次性設定，約 5 分鐘）**\n\n"
+                "**① 建立 Google Cloud 專案**\n"
+                "開啟 [Google Cloud Console](https://console.cloud.google.com/projectcreate)"
+                "，取任意名稱（例如 music-assistant）並建立。\n\n"
+                "**② 啟用 YouTube Data API v3**\n"
+                "開啟 [YouTube Data API v3 頁面]"
+                "(https://console.cloud.google.com/apis/library/youtube.googleapis.com)"
+                "，確認左上角選到剛建立的專案，按「啟用」。\n\n"
+                "**③ 設定 OAuth 同意畫面**\n"
+                "開啟 [OAuth 同意畫面](https://console.cloud.google.com/apis/credentials/consent)"
+                "，User Type 選「**外部**」，填入應用程式名稱與你的 Email 後儲存。\n"
+                "在「測試使用者」中加入你自己的 Google 帳號。\n"
+                "⚠️ 重要：發布狀態若停留在「測試中」，登入 Token 只有 **7 天**效期，"
+                "到期會需要重新登入；到「目標對象」把狀態改為「**發布**（正式版）」即可長期有效。\n\n"
+                "**④ 建立 OAuth Client ID**\n"
+                "開啟 [憑證頁面](https://console.cloud.google.com/apis/credentials)"
+                "，按「建立憑證 → OAuth 用戶端 ID」，應用程式類型選"
+                "「**電視和受限輸入裝置**（TV and Limited Input devices）」。\n\n"
+                "**⑤ 複製憑證**\n"
+                "建立完成後，把顯示的 Client ID 與 Client Secret 貼到下方兩個欄位，"
+                "儲存後回到上方按「開始登入」。"
             ),
             required=False,
+            help_link="https://console.cloud.google.com/apis/credentials",
         ))
         entries.append(ConfigEntry(
             key=CONF_CLIENT_ID,
             type=ConfigEntryType.STRING,
             label="OAuth Client ID",
-            description="Google Cloud Console 取得的 OAuth 2.0 Client ID。",
+            description=(
+                "在 Google Cloud Console 憑證頁面取得，"
+                "格式如 xxxxx.apps.googleusercontent.com。"
+            ),
             default_value="",
             required=False,
             value=values.get(CONF_CLIENT_ID, ""),
+            help_link="https://console.cloud.google.com/apis/credentials",
         ))
+        # 刻意使用一般 STRING 而非 SECURE_STRING（密碼欄位）：
+        # 避免瀏覽器把它當帳密自動填入/覆寫造成儲存錯誤，也方便核對內容。
+        # 相容舊版：先前以 SECURE_STRING 儲存的加密值在讀取時自動解密。
         entries.append(ConfigEntry(
             key=CONF_CLIENT_SECRET,
-            type=ConfigEntryType.SECURE_STRING,
+            type=ConfigEntryType.STRING,
             label="OAuth Client Secret",
-            description="對應 Client ID 的 Client Secret。",
+            description=(
+                "對應上方 Client ID 的 Client Secret（格式如 GOCSPX-…）。"
+                "此欄位為一般文字方塊以避免瀏覽器密碼自動填入造成儲存錯誤；"
+                "請勿讓瀏覽器將其存為密碼。"
+            ),
             default_value="",
             required=False,
-            value=values.get(CONF_CLIENT_SECRET, ""),
+            value=_decrypt_if_needed(mass, values.get(CONF_CLIENT_SECRET, "") or ""),
         ))
     else:  # ytdlp
         entries.append(ConfigEntry(
             key="ytdlp_mode_note",
             type=ConfigEntryType.ALERT,
             label=(
-                "ℹ️ 純 yt-dlp 模式：不使用任何 API，也不需要登入。\n"
-                "個人播放清單功能不可用（除非提供 Cookies 檔案）。\n"
-                "搜尋和播放速度較慢，但完全不依賴 Google API。"
+                "ℹ️ **純 yt-dlp 模式**：不使用任何 API，也不需要登入。\n\n"
+                "搜尋和瀏覽速度較慢（約 1-3 秒），但完全不依賴 Google API。\n"
+                "個人播放清單、年齡限制影片需在下方「Cookies 檔案路徑」提供 cookies.txt。"
             ),
             required=False,
         ))
@@ -639,17 +731,21 @@ async def get_config_entries(
     entries.append(ConfigEntry(
         key=CONF_COOKIES_FILE,
         type=ConfigEntryType.STRING,
-        label="Cookies 檔案路徑（選填）",
+        label="Cookies 檔案路徑（選填，進階）",
         description=(
-            "Netscape 格式的 cookies.txt 完整路徑，例如 /config/yt_cookies.txt。\n\n"
-            "tv / custom 模式下：年齡限制和私人影片透過 InnerTube + OAuth 直接存取，"
-            "通常不需要 cookies。\n"
-            "yt-dlp 模式下：年齡限制和私人影片需要此 cookies 檔案。\n\n"
-            "匯出方式：在 Chrome/Firefox 使用 Get cookies.txt 擴充功能匯出 YouTube cookies。"
+            "Netscape 格式 cookies.txt 的完整路徑，例如 /config/yt_cookies.txt。\n\n"
+            "什麼時候需要：\n"
+            "- tv / custom 模式：通常「不需要」（OAuth 已涵蓋年齡限制／私人影片）；"
+            "提供後可額外解鎖「觀看紀錄」與已儲存他人清單。\n"
+            "- ytdlp 模式：個人播放清單、年齡限制／私人影片需要它。\n\n"
+            "匯出方式：在瀏覽器安裝「Get cookies.txt LOCALLY」之類的擴充功能，"
+            "登入 youtube.com 後匯出 cookies，把檔案放到 MA 可讀取的路徑再填入這裡。\n"
+            "注意：cookies 內含登入憑證，請妥善保管；登出瀏覽器會使其失效。"
         ),
         default_value="",
         required=False,
         value=values.get(CONF_COOKIES_FILE, ""),
+        help_link="https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp",
     ))
 
     entries.append(ConfigEntry(key="divider_recommend", type=ConfigEntryType.DIVIDER, label=""))
@@ -670,29 +766,59 @@ async def get_config_entries(
     entries.append(ConfigEntry(
         key=CONF_YTMUSIC_LANGUAGE,
         type=ConfigEntryType.STRING,
-        label="YouTube Music API 語系（ytmusicapi language）",
+        label="YouTube Music API 語系",
         description=(
-            "傳給 ytmusicapi.YTMusic(language=…)，影響 YTMusic 搜尋／藝人／推薦等回傳語言。\n"
-            "常見值：en、zh_TW、zh_CN、ja、ko（依 ytmusicapi 支援為準）。\n"
-            "留空則使用 en。"
+            "影響 YTMusic 搜尋／藝人／推薦等回傳的語言（如藝人名的在地化顯示）。"
+            "留空則使用英文（en）。"
         ),
         default_value="",
         required=False,
         value=values.get(CONF_YTMUSIC_LANGUAGE, ""),
+        options=[
+            ConfigValueOption(title="英文（預設）", value=""),
+            ConfigValueOption(title="繁體中文（zh_TW）", value="zh_TW"),
+            ConfigValueOption(title="簡體中文（zh_CN）", value="zh_CN"),
+            ConfigValueOption(title="日文（ja）", value="ja"),
+            ConfigValueOption(title="韓文（ko）", value="ko"),
+        ],
+        multi_value=False,
     ))
 
     entries.append(ConfigEntry(
         key=CONF_YTMUSIC_ENRICH_ARTIST,
         type=ConfigEntryType.STRING,
-        label="YTM 補齊藝人名（get_song）",
+        label="以 YouTube Music 補齊藝人名",
         description=(
-            "off：不呼叫 get_song 覆寫藝人，搜尋用字與 Data API 一致（全英文）。\n"
-            "title_cjk：僅當影片標題含中日韓字時才用 YTM 作者名（省 API，英文歌不本地化）。\n"
-            "always：盡量採用 YTM author；但若頻道名像 Glee／soundtrack 等西方合輯，仍保留英文。"
+            "從 YouTube 影片建立曲目時，是否額外向 YouTube Music 查詢"
+            "更精確／在地化的藝人名稱。點各選項可看個別說明。"
         ),
         default_value="always",
         required=False,
         value=values.get(CONF_YTMUSIC_ENRICH_ARTIST, "always"),
+        options=[
+            ConfigValueOption(
+                title="總是補齊（建議）",
+                value="always",
+                description=(
+                    "盡量採用 YouTube Music 的藝人名；"
+                    "但西方合輯／原聲帶（如 Glee Cast、soundtrack）仍保留英文以利搜尋。"
+                ),
+            ),
+            ConfigValueOption(
+                title="僅中日韓標題",
+                value="title_cjk",
+                description=(
+                    "只有影片標題含中日韓文字時才查詢補齊，"
+                    "節省 API 呼叫，英文歌不做在地化。"
+                ),
+            ),
+            ConfigValueOption(
+                title="關閉",
+                value="off",
+                description="不額外查詢，藝人名與 YouTube 頻道名／標題解析結果一致（多為英文）。",
+            ),
+        ],
+        multi_value=False,
     ))
 
     return tuple(entries)
@@ -885,7 +1011,11 @@ print(json.dumps(d))
             None, self._sync_innertube_clients_from_ytdlp, self.logger
         )
         self._client_id     = self.config.get_value(CONF_CLIENT_ID) or ""
-        self._client_secret = self.config.get_value(CONF_CLIENT_SECRET) or ""
+        # client_secret 欄位已由 SECURE_STRING 改為 STRING；
+        # 舊設定中儲存的加密值 get_value 不會自動解密，這裡相容處理
+        self._client_secret = _decrypt_if_needed(
+            self.mass, self.config.get_value(CONF_CLIENT_SECRET) or ""
+        )
         self._auth_mode = self.config.get_value(CONF_AUTH_MODE) or "tv"
         self._access_token  = self.config.get_value(CONF_AUTH_TOKEN) or ""
         self._refresh_token = self.config.get_value(CONF_REFRESH_TOKEN) or ""
