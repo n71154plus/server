@@ -1,0 +1,68 @@
+{
+  "domain": "youtube",
+  "name": "YouTube",
+  "description": "自定義 YouTube 音樂來源（yt-dlp），支援 OAuth2 Device Flow 帳號登入以提升串流穩定性",
+  "type": "music",
+  "codeowners": ["randy.huang"],
+  "config_entries": [
+    {
+      "key": "auth",
+      "type": "action",
+      "label": "使用 YouTube 帳號登入（Device Flow）"
+    },
+    {
+      "key": "auth_token",
+      "type": "secure_string",
+      "label": "Access Token",
+      "default_value": "",
+      "required": false
+    },
+    {
+      "key": "refresh_token",
+      "type": "secure_string",
+      "label": "Refresh Token",
+      "default_value": "",
+      "required": false
+    },
+    {
+      "key": "token_type",
+      "type": "string",
+      "label": "Token Type",
+      "default_value": "Bearer",
+      "required": false
+    },
+    {
+      "key": "expiry_time",
+      "type": "string",
+      "label": "Token Expiry",
+      "default_value": "",
+      "required": false
+    },
+    {
+      "key": "cookies_file",
+      "type": "string",
+      "label": "Cookies 檔案路徑（備選）",
+      "default_value": "",
+      "required": false
+    },
+    {
+      "key": "ytmusic_language",
+      "type": "string",
+      "label": "YouTube Music API 語系（ytmusicapi language）",
+      "default_value": "",
+      "required": false,
+      "description": "留空為 en；可設 zh_TW、ja、ko 等"
+    },
+    {
+      "key": "ytmusic_enrich_artist",
+      "type": "string",
+      "label": "YTM 補齊藝人名",
+      "default_value": "always",
+      "required": false,
+      "description": "off | title_cjk | always"
+    }
+  ],
+  "requirements": ["yt-dlp", "aiohttp"],
+  "multi_instance": true,
+  "icon": "mdi:youtube"
+}
