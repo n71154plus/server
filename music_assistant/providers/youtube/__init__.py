@@ -734,6 +734,7 @@ class YouTubeProvider(MusicProvider):
     _cookies_cache: tuple[float, dict[str, str]] | None = None  # cookies.txt 解析快取（mtime, cookies）
     _token_lock: Any = None                    # 防止並發 token refresh
     _ytm_author_cache: dict[str, tuple[float, str]] = {}  # get_song author 快取（TTL 24h）
+    _relogin_warn_at: float = 0.0              # 「請重新登入」警告節流（每小時一次）
 
     # MA provider key → yt-dlp client key
     _YTDLP_CLIENT_MAP: dict[str, str] = {
@@ -1343,7 +1344,12 @@ print(json.dumps(d))
         if time.time() < self._token_expires_at - 300:
             return
         if not self._refresh_token:
-            self.logger.warning("[YouTube] Token 快過期且無 refresh token，請重新登入")
+            # 節流：每小時最多提醒一次，避免每次搜尋/播放都刷一行警告
+            if time.time() >= self._relogin_warn_at:
+                self._relogin_warn_at = time.time() + 3600
+                self.logger.warning(
+                    "[YouTube] Token 快過期且無 refresh token，請重新登入"
+                )
             return
         if self._token_lock is None:
             self._token_lock = asyncio.Lock()
@@ -1378,7 +1384,13 @@ print(json.dumps(d))
                 result = await resp.json()
 
             if "access_token" not in result:
-                self.logger.error(f"[YouTube] Token 刷新失敗: {result}")
+                if result.get("error") == "invalid_grant":
+                    # invalid_grant = refresh token 已被 Google 判定永久失效
+                    # （使用者撤銷授權、測試模式 7 天過期、切換 API 模式導致
+                    # client 不符等），保留只會讓之後每次操作都白跑一次刷新
+                    await self._invalidate_tokens()
+                else:
+                    self.logger.error(f"[YouTube] Token 刷新失敗: {result}")
                 return
 
             self._access_token     = result["access_token"]
@@ -1404,6 +1416,37 @@ print(json.dumps(d))
 
         except Exception as exc:
             self.logger.error(f"[YouTube] Token 刷新例外: {exc}")
+
+    async def _invalidate_tokens(self) -> None:
+        """
+        清除已失效的 OAuth token（記憶體 + 持久化設定）並更新功能宣告。
+
+        用於 Google 回傳 invalid_grant 時：token 已永久失效，
+        清掉可避免之後每次搜尋/播放前都重複發出注定失敗的刷新請求。
+        """
+        self.logger.error(
+            "[YouTube] Refresh token 已失效（invalid_grant），已清除並停止自動刷新。"
+            "請到 設定 → YouTube → 重新登入。"
+            "若切換過 API 模式或使用 TV 內建憑證常失效，建議改用自建 Google Cloud 憑證"
+            "（OAuth 同意畫面需為「正式版」，測試模式的 token 固定 7 天過期）。"
+        )
+        self._access_token = ""
+        self._refresh_token = ""
+        self._token_expires_at = 0.0
+        try:
+            await self.mass.config.save_provider_config(
+                provider_domain=self.domain,
+                values={
+                    CONF_AUTH_TOKEN: "",
+                    CONF_REFRESH_TOKEN: "",
+                    CONF_EXPIRY_TIME: "",
+                },
+                instance_id=self.instance_id,
+            )
+        except Exception as exc:
+            self.logger.warning(f"[YouTube] 清除失效 token 設定時發生例外: {exc}")
+        # 沒有帳號後個人播放清單等功能不可用，同步更新功能宣告
+        self._update_supported_features()
 
     # ------------------------------------------------------------------
     # yt-dlp 認證參數
