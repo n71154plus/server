@@ -135,6 +135,25 @@ CONF_YTMUSIC_ENRICH_ARTIST = "ytmusic_enrich_artist"  # get_song 補藝人名：
 # 模組層級函數（MA 框架呼叫）
 # ---------------------------------------------------------------------------
 
+def _make_option(title: str, value: str, description: str | None = None) -> Any:
+    """
+    建立 ConfigValueOption，相容新舊版 music_assistant_models。
+
+    :param title: 選項顯示名稱。
+    :param value: 選項儲存值。
+    :param description: 逐選項說明（舊版 models 不支援時自動略過）。
+    """
+    from music_assistant_models.config_entries import ConfigValueOption
+
+    if description is not None:
+        try:
+            return ConfigValueOption(title=title, value=value, description=description)
+        except TypeError:
+            # 舊版 models 的 ConfigValueOption 尚無 description 參數
+            pass
+    return ConfigValueOption(title=title, value=value)
+
+
 def _decrypt_if_needed(mass: MusicAssistant, value: str) -> str:
     """
     相容處理舊版加密值。
@@ -531,20 +550,23 @@ async def get_config_entries(
     ))
 
     auth_mode = values.get(CONF_AUTH_MODE, "tv")
-    from music_assistant_models.config_entries import ConfigValueOption
     entries.append(ConfigEntry(
         key=CONF_AUTH_MODE,
         type=ConfigEntryType.STRING,
         label="API 模式選擇",
         description=(
             "決定搜尋／瀏覽走哪個 YouTube API。三種模式都能搜尋、播放與瀏覽公開內容；"
-            "差別在速度、配額與需要的前置設定。點各選項可看個別說明。"
+            "差別在速度、配額與需要的前置設定。\n"
+            "🟢 TV：速度快（200-400ms）、零配額、免 Cloud 專案，失敗自動退回 yt-dlp。\n"
+            "🟡 自建：最快（100-400ms）但每天 10,000 units 配額，需建 Cloud 專案，"
+            "配額用完自動切換 InnerTube → yt-dlp。\n"
+            "🔴 僅 yt-dlp：設定最簡單、不依賴 Google API，但較慢（1-3 秒）。"
         ),
         default_value="tv",
         required=False,
         value=auth_mode,
         options=[
-            ConfigValueOption(
+            _make_option(
                 title="🟢 YouTube TV（InnerTube，建議）",
                 value="tv",
                 description=(
@@ -553,7 +575,7 @@ async def get_config_entries(
                     "失敗時自動退回 yt-dlp。"
                 ),
             ),
-            ConfigValueOption(
+            _make_option(
                 title="🟡 自建 Google Cloud（Data API v3）",
                 value="custom",
                 description=(
@@ -562,7 +584,7 @@ async def get_config_entries(
                     "配額用完自動切換 InnerTube → yt-dlp，不需重啟。"
                 ),
             ),
-            ConfigValueOption(
+            _make_option(
                 title="🔴 僅 yt-dlp（無需 API）",
                 value="ytdlp",
                 description=(
@@ -775,11 +797,11 @@ async def get_config_entries(
         required=False,
         value=values.get(CONF_YTMUSIC_LANGUAGE, ""),
         options=[
-            ConfigValueOption(title="英文（預設）", value=""),
-            ConfigValueOption(title="繁體中文（zh_TW）", value="zh_TW"),
-            ConfigValueOption(title="簡體中文（zh_CN）", value="zh_CN"),
-            ConfigValueOption(title="日文（ja）", value="ja"),
-            ConfigValueOption(title="韓文（ko）", value="ko"),
+            _make_option(title="英文（預設）", value=""),
+            _make_option(title="繁體中文（zh_TW）", value="zh_TW"),
+            _make_option(title="簡體中文（zh_CN）", value="zh_CN"),
+            _make_option(title="日文（ja）", value="ja"),
+            _make_option(title="韓文（ko）", value="ko"),
         ],
         multi_value=False,
     ))
@@ -790,13 +812,16 @@ async def get_config_entries(
         label="以 YouTube Music 補齊藝人名",
         description=(
             "從 YouTube 影片建立曲目時，是否額外向 YouTube Music 查詢"
-            "更精確／在地化的藝人名稱。點各選項可看個別說明。"
+            "更精確／在地化的藝人名稱。\n"
+            "總是補齊：盡量採用 YTM 藝人名（西方合輯／原聲帶仍保留英文）。\n"
+            "僅中日韓標題：標題含中日韓字才查詢，節省 API 呼叫。\n"
+            "關閉：藝人名與頻道名／標題解析結果一致（多為英文）。"
         ),
         default_value="always",
         required=False,
         value=values.get(CONF_YTMUSIC_ENRICH_ARTIST, "always"),
         options=[
-            ConfigValueOption(
+            _make_option(
                 title="總是補齊（建議）",
                 value="always",
                 description=(
@@ -804,7 +829,7 @@ async def get_config_entries(
                     "但西方合輯／原聲帶（如 Glee Cast、soundtrack）仍保留英文以利搜尋。"
                 ),
             ),
-            ConfigValueOption(
+            _make_option(
                 title="僅中日韓標題",
                 value="title_cjk",
                 description=(
@@ -812,7 +837,7 @@ async def get_config_entries(
                     "節省 API 呼叫，英文歌不做在地化。"
                 ),
             ),
-            ConfigValueOption(
+            _make_option(
                 title="關閉",
                 value="off",
                 description="不額外查詢，藝人名與 YouTube 頻道名／標題解析結果一致（多為英文）。",
